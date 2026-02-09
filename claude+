@@ -1,0 +1,243 @@
+#!/bin/bash
+# claude+ Project Chooser
+# Pick from all projects with Claude Code sessions, or create a new one.
+# Uses fzf for interactive selection and python3 for JSON parsing.
+
+set -euo pipefail
+
+USER_PROJECTS_DIR="$HOME/projects"
+
+# Build the project list using python3
+build_project_list() {
+    python3 << 'PYEOF'
+import json
+import os
+import glob
+from datetime import datetime, timezone
+claude_projects_dir = os.path.expanduser("~/.claude/projects")
+user_projects_dir = os.path.expanduser("~/projects")
+
+projects = {}  # path -> {sessions, last_modified, summary}
+
+# Scan ~/.claude/projects/ for session data
+if os.path.isdir(claude_projects_dir):
+    for entry in os.scandir(claude_projects_dir):
+        if not entry.is_dir():
+            continue
+
+        real_path = None
+        sessions = 0
+        last_modified = None
+        summary = ""
+
+        index_file = os.path.join(entry.path, "sessions-index.json")
+        if os.path.isfile(index_file):
+            try:
+                with open(index_file) as f:
+                    data = json.load(f)
+                real_path = data.get("originalPath")
+                entries = data.get("entries", [])
+                sessions = len(entries)
+                # Find most recent entry
+                latest = None
+                for e in entries:
+                    mod = e.get("modified")
+                    if mod and (latest is None or mod > latest.get("modified", "")):
+                        latest = e
+                if latest:
+                    last_modified = latest.get("modified", "")
+                    s = latest.get("summary", "")
+                    if s and s != "User Exited Claude Code CLI Session":
+                        summary = s
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Also count jsonl files (may have more than what's in the index)
+        jsonl_files = glob.glob(os.path.join(entry.path, "*.jsonl"))
+        if not sessions:
+            sessions = len(jsonl_files)
+
+        # If no real_path from index, try to get it from jsonl cwd field
+        if not real_path and jsonl_files:
+            # Try each jsonl (newest first) until we find a cwd
+            for jsonl_file in sorted(jsonl_files, key=os.path.getmtime, reverse=True):
+                try:
+                    with open(jsonl_file) as f:
+                        for i, line in enumerate(f):
+                            if i > 5:
+                                break
+                            try:
+                                d = json.loads(line)
+                                if d.get("cwd"):
+                                    real_path = d["cwd"]
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+                except OSError:
+                    continue
+                if real_path:
+                    break
+
+        # If still no real_path, skip this entry
+        if not real_path:
+            continue
+
+        # Get last_modified from jsonl file mtime if not from index
+        if not last_modified and jsonl_files:
+            newest_mtime = max(os.path.getmtime(f) for f in jsonl_files)
+            last_modified = datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+
+        # If no summary from index, try to get firstPrompt or summary from jsonl
+        if not summary and jsonl_files:
+            newest_jsonl = max(jsonl_files, key=os.path.getmtime)
+            try:
+                with open(newest_jsonl) as f:
+                    for i, line in enumerate(f):
+                        if i > 30:
+                            break
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") == "summary" and d.get("summary"):
+                                summary = d["summary"]
+                                break
+                        except json.JSONDecodeError:
+                            continue
+            except OSError:
+                pass
+
+        if sessions > 0:
+            projects[real_path] = {
+                "sessions": sessions,
+                "last_modified": last_modified or "",
+                "summary": summary,
+            }
+
+# Scan ~/projects/ for directories that don't have sessions yet
+if os.path.isdir(user_projects_dir):
+    for entry in os.scandir(user_projects_dir):
+        if entry.is_dir() and entry.path not in projects:
+            projects[entry.path] = {
+                "sessions": 0,
+                "last_modified": "",
+                "summary": "",
+            }
+
+# Sort: projects with sessions first (by last_modified desc), then sessionless alphabetically
+with_sessions = []
+without_sessions = []
+
+for path, info in projects.items():
+    if info["sessions"] > 0:
+        with_sessions.append((path, info))
+    else:
+        without_sessions.append((path, info))
+
+with_sessions.sort(key=lambda x: x[1]["last_modified"], reverse=True)
+without_sessions.sort(key=lambda x: os.path.basename(x[0]).lower())
+
+# Output format: HAS_SESSIONS:PATH\tDISPLAY_LINE
+# HAS_SESSIONS is 1 or 0, used to decide --continue flag
+# PATH is hidden from fzf (--with-nth=2 shows only after the tab)
+
+for path, info in with_sessions:
+    name = os.path.basename(path)
+    date_str = info["last_modified"][:10] if info["last_modified"] else "unknown"
+    summary_text = info["summary"][:60].replace("\n", " ") if info["summary"] else ""
+    sess = info["sessions"]
+    sess_word = "session" if sess == 1 else "sessions"
+    line = f"\033[1;36m{name}\033[0m | {sess} {sess_word} | last: {date_str}"
+    if summary_text:
+        line += f" | \033[0;33m{summary_text}\033[0m"
+    print(f"1:{path}\t{line}")
+
+for path, info in without_sessions:
+    name = os.path.basename(path)
+    line = f"\033[0;37m{name}\033[0m | \033[2mno sessions\033[0m"
+    print(f"0:{path}\t{line}")
+PYEOF
+}
+
+# Main
+main() {
+    if ! command -v fzf &>/dev/null; then
+        echo "Error: fzf is required. Install with: sudo pacman -S fzf" >&2
+        exit 1
+    fi
+
+    # Build project list
+    local project_list
+    project_list=$(build_project_list)
+
+    if [ -z "$project_list" ]; then
+        echo "No projects found." >&2
+        exit 1
+    fi
+
+    # Prepend "+ NEW PROJECT" option
+    local new_project_line=$'\t\033[1;32m+ NEW PROJECT\033[0m'
+    local full_list="${new_project_line}"$'\n'"${project_list}"
+
+    # Run fzf
+    local selection
+    selection=$(echo -e "$full_list" | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=2 \
+        --header="Select a project (Enter to choose, Esc to cancel)" \
+        --header-first \
+        --no-sort \
+        --reverse \
+        --height=80% \
+        --border \
+        --prompt="project> " \
+    ) || exit 0  # Esc/Ctrl-C exits cleanly
+
+    # Extract the path (before the tab) - format is "HAS_SESSIONS:PATH\tDISPLAY"
+    local selected_field
+    selected_field=$(echo "$selection" | cut -f1)
+    local selected_path="${selected_field#*:}"
+    local has_sessions_flag="${selected_field%%:*}"
+
+    # Handle "+ NEW PROJECT" (empty path)
+    if [ -z "$selected_path" ]; then
+        echo -n "New project name: "
+        read -r project_name
+        if [ -z "$project_name" ]; then
+            echo "No name given, aborting." >&2
+            exit 1
+        fi
+
+        local new_dir="$USER_PROJECTS_DIR/$project_name"
+        if [ -d "$new_dir" ]; then
+            echo "Directory already exists: $new_dir" >&2
+            echo "Launching Claude in existing directory..."
+            cd "$new_dir"
+            exec claude --dangerously-skip-permissions
+        fi
+
+        mkdir -p "$new_dir"
+        cd "$new_dir"
+        git init
+        touch CLAUDE.md
+        echo "Created project: $new_dir"
+        exec claude --dangerously-skip-permissions
+    fi
+
+    # Handle existing project
+    if [ ! -d "$selected_path" ]; then
+        echo "Directory no longer exists: $selected_path" >&2
+        exit 1
+    fi
+
+    cd "$selected_path"
+
+    if [ "$has_sessions_flag" = "1" ]; then
+        echo "Resuming in: $selected_path"
+        exec claude --dangerously-skip-permissions --continue
+    else
+        echo "Starting new session in: $selected_path"
+        exec claude --dangerously-skip-permissions
+    fi
+}
+
+main "$@"
