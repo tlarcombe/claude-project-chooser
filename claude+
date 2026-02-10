@@ -173,9 +173,10 @@ main() {
         exit 1
     fi
 
-    # Prepend "+ NEW PROJECT" option
+    # Prepend special options
     local new_project_line=$'\t\033[1;32m+ NEW PROJECT\033[0m'
-    local full_list="${new_project_line}"$'\n'"${project_list}"
+    local no_project_line=$'NOPROJ:\t\033[1;33m~ NO PROJECT (no git)\033[0m'
+    local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
 
     # Run fzf
     local selection
@@ -197,6 +198,12 @@ main() {
     selected_field=$(echo "$selection" | cut -f1)
     local selected_path="${selected_field#*:}"
     local has_sessions_flag="${selected_field%%:*}"
+
+    # Handle "~ NO PROJECT"
+    if [ "$has_sessions_flag" = "NOPROJ" ]; then
+        echo "Starting Claude without a project..."
+        exec claude --dangerously-skip-permissions
+    fi
 
     # Handle "+ NEW PROJECT" (empty path)
     if [ -z "$selected_path" ]; then
