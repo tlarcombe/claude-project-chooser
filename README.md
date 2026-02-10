@@ -1,6 +1,6 @@
 # claude+
 
-An fzf-based project chooser for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Pick from all your projects with Claude sessions, or create a new one.
+An fzf-based project chooser for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Pick from all your projects with Claude sessions, or create a new one. Find out how it helps here: [larcombe.tech](https://larcombe.tech/blog/claude-plus-project-chooser.html).
 
 ## What it does
 
