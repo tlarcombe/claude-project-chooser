@@ -2,6 +2,7 @@
 # claude+ Project Chooser
 # Pick from all projects with Claude Code sessions, or create a new one.
 # Uses fzf for interactive selection and python3 for JSON parsing.
+# Links and other updates here: https://larcombe.tech/blog/
 
 set -euo pipefail
 
