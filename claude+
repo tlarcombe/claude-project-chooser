@@ -7,6 +7,90 @@
 set -euo pipefail
 
 USER_PROJECTS_DIR="$HOME/projects"
+CLAUDE_OUTPUT_LOG=$(mktemp /tmp/claude-session.XXXXXX)
+trap "rm -f '$CLAUDE_OUTPUT_LOG'" EXIT
+
+# Launch claude with automatic rate-limit retry.
+# Uses `script` to transparently capture terminal output.
+# After claude exits, checks for rate limit message. If found,
+# parses the reset time, sleeps until then, and relaunches with --continue.
+launch_claude() {
+    local claude_args=("$@")
+
+    while true; do
+        > "$CLAUDE_OUTPUT_LOG"  # clear previous capture
+        script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG"
+
+        # Check last 10KB of captured output for rate limit
+        local tail_output
+        tail_output=$(tail -c 10000 "$CLAUDE_OUTPUT_LOG" | strings)
+
+        if echo "$tail_output" | grep -q "hit your limit"; then
+            local reset_line
+            reset_line=$(echo "$tail_output" | grep "resets" | tail -1)
+
+            local sleep_secs
+            sleep_secs=$(python3 << PYEOF
+import re, sys
+from datetime import datetime, timedelta
+import zoneinfo
+
+line = '''$reset_line'''
+match = re.search(r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)', line, re.IGNORECASE)
+if not match:
+    print(300)
+    sys.exit()
+
+time_str = match.group(1).strip().upper().replace(' ', '')
+tz_str = match.group(2).strip()
+
+try:
+    tz = zoneinfo.ZoneInfo(tz_str)
+except Exception:
+    tz = zoneinfo.ZoneInfo('UTC')
+
+now = datetime.now(tz)
+parsed = None
+for fmt in ['%I:%M%p', '%I%p']:
+    try:
+        parsed = datetime.strptime(time_str, fmt)
+        break
+    except ValueError:
+        continue
+
+if not parsed:
+    print(300)
+    sys.exit()
+
+reset = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
+if reset <= now:
+    reset += timedelta(days=1)
+
+diff = int((reset - now).total_seconds()) + 60
+print(max(diff, 60))
+PYEOF
+)
+            local mins=$((sleep_secs / 60))
+            local reset_time
+            reset_time=$(echo "$reset_line" | grep -oP 'resets\s+\K[^(]+' | sed 's/ *$//')
+
+            echo ""
+            echo "══════════════════════════════════════════════════════"
+            echo "  Rate limit hit. Auto-resuming in ~${mins} minutes"
+            echo "  (reset at ${reset_time:-unknown})"
+            echo "  Press Ctrl-C to cancel"
+            echo "══════════════════════════════════════════════════════"
+            echo ""
+
+            sleep "$sleep_secs"
+
+            echo "Resuming session..."
+            claude_args=(--dangerously-skip-permissions --continue)
+        else
+            break
+        fi
+    done
+}
 
 # Build the project list using python3
 build_project_list() {
@@ -203,7 +287,8 @@ main() {
     # Handle "~ NO PROJECT"
     if [ "$has_sessions_flag" = "NOPROJ" ]; then
         echo "Starting Claude without a project..."
-        exec claude --dangerously-skip-permissions
+        launch_claude --dangerously-skip-permissions
+        exit 0
     fi
 
     # Handle "+ NEW PROJECT" (empty path)
@@ -220,7 +305,8 @@ main() {
             echo "Directory already exists: $new_dir" >&2
             echo "Launching Claude in existing directory..."
             cd "$new_dir"
-            exec claude --dangerously-skip-permissions
+            launch_claude --dangerously-skip-permissions
+            exit 0
         fi
 
         mkdir -p "$new_dir"
@@ -228,7 +314,8 @@ main() {
         git init
         touch CLAUDE.md
         echo "Created project: $new_dir"
-        exec claude --dangerously-skip-permissions
+        launch_claude --dangerously-skip-permissions
+        exit 0
     fi
 
     # Handle existing project
@@ -241,10 +328,10 @@ main() {
 
     if [ "$has_sessions_flag" = "1" ]; then
         echo "Resuming in: $selected_path"
-        exec claude --dangerously-skip-permissions --continue
+        launch_claude --dangerously-skip-permissions --continue
     else
         echo "Starting new session in: $selected_path"
-        exec claude --dangerously-skip-permissions
+        launch_claude --dangerously-skip-permissions
     fi
 }
 
