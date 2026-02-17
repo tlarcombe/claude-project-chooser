@@ -17,17 +17,38 @@ trap "rm -f '$CLAUDE_OUTPUT_LOG'" EXIT
 launch_claude() {
     local claude_args=("$@")
 
+    local RATE_LIMIT_DEBUG="$HOME/.claude/rate-limit-debug.log"
+
     while true; do
         > "$CLAUDE_OUTPUT_LOG"  # clear previous capture
         script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG"
 
-        # Check last 10KB of captured output for rate limit
+        # Strip ANSI/terminal codes using Python (handles UTF-8 middle dots, etc.)
+        # strings(1) breaks on non-ASCII chars like the · separator in rate-limit messages
         local tail_output
-        tail_output=$(tail -c 10000 "$CLAUDE_OUTPUT_LOG" | strings)
+        tail_output=$(tail -c 50000 "$CLAUDE_OUTPUT_LOG" | python3 -c "
+import sys, re
+data = sys.stdin.buffer.read()
+data = re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b' ', data)   # CSI sequences
+data = re.sub(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)', b' ', data)  # OSC sequences
+data = re.sub(rb'\x1b.', b' ', data)                     # other escapes
+data = data.replace(b'\r', b'\n')                         # CR -> newline
+data = re.sub(rb'[\x00-\x08\x0b-\x1f\x7f]', b' ', data) # strip control chars
+text = data.decode('utf-8', errors='replace')
+lines = [' '.join(l.split()) for l in text.split('\n') if l.strip()]
+print('\n'.join(lines[-500:]))
+")
 
-        if echo "$tail_output" | grep -q "hit your limit"; then
+        # Debug log: save rate-limit-related lines for post-mortem
+        {
+            echo "=== $(date) ==="
+            echo "$tail_output" | grep -i "limit\|resets\|hit\|usage" || echo "(no match)"
+        } >> "$RATE_LIMIT_DEBUG" 2>/dev/null
+
+        # Detect rate limit: matches "hit your limit", "fast limit reached", etc.
+        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage"; then
             local reset_line
-            reset_line=$(echo "$tail_output" | grep "resets" | tail -1)
+            reset_line=$(echo "$tail_output" | grep -i "resets" | tail -1)
 
             local sleep_secs
             sleep_secs=$(python3 << PYEOF
@@ -36,6 +57,16 @@ from datetime import datetime, timedelta
 import zoneinfo
 
 line = '''$reset_line'''
+
+# "resets in Xh Ym" format (fast mode / cooldown)
+m = re.search(r'resets in\s+(?:(\d+)h\s*)?(?:(\d+)m)?', line, re.IGNORECASE)
+if m and (m.group(1) or m.group(2)):
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    print(max(h * 3600 + mins * 60 + 60, 60))
+    sys.exit()
+
+# "resets 11pm (America/New_York)" format (regular limit)
 match = re.search(r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)', line, re.IGNORECASE)
 if not match:
     print(300)
@@ -71,13 +102,17 @@ print(max(diff, 60))
 PYEOF
 )
             local mins=$((sleep_secs / 60))
-            local reset_time
-            reset_time=$(echo "$reset_line" | grep -oP 'resets\s+\K[^(]+' | sed 's/ *$//')
+            local reset_desc
+            if echo "$reset_line" | grep -qi "resets in"; then
+                reset_desc=$(echo "$reset_line" | grep -oiP 'resets in [\dhm ]+' | head -1)
+            else
+                reset_desc=$(echo "$reset_line" | grep -oP 'resets\s+\K[^(]+' | sed 's/ *$//')
+            fi
 
             echo ""
             echo "══════════════════════════════════════════════════════"
             echo "  Rate limit hit. Auto-resuming in ~${mins} minutes"
-            echo "  (reset at ${reset_time:-unknown})"
+            echo "  (${reset_desc:-unknown reset time})"
             echo "  Press Ctrl-C to cancel"
             echo "══════════════════════════════════════════════════════"
             echo ""
