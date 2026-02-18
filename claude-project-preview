@@ -1,0 +1,170 @@
+#!/bin/bash
+# claude-project-preview: fzf preview pane for claude+ project picker
+# Argument: first fzf field — "HAS_SESSIONS:PATH", "NOPROJ:", or ""
+
+BOLD='\033[1m'
+DIM='\033[2m'
+CYAN='\033[1;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+RESET='\033[0m'
+
+field="${1:-}"
+path="${field#*:}"
+has_sessions="${field%%:*}"
+
+# ── New Project ────────────────────────────────────────────────────────────────
+if [ -z "$field" ] || [ -z "$path" ]; then
+    echo -e "${GREEN}${BOLD}✦ New Project${RESET}"
+    echo ""
+    echo "  Create a new project directory in ~/projects/"
+    echo "  and start a fresh Claude Code session."
+    echo ""
+    echo -e "  ${DIM}Will: mkdir, git init, create CLAUDE.md${RESET}"
+    exit 0
+fi
+
+# ── No Project ─────────────────────────────────────────────────────────────────
+if [ "$has_sessions" = "NOPROJ" ]; then
+    echo -e "${YELLOW}${BOLD}◈ No Project${RESET}"
+    echo ""
+    echo "  Launch Claude Code without a project directory."
+    echo ""
+    echo -e "  ${DIM}Useful for quick tasks, questions, or scripts${RESET}"
+    exit 0
+fi
+
+# ── Existing Project ───────────────────────────────────────────────────────────
+name=$(basename "$path")
+
+echo -e "${BOLD}${CYAN}${name}${RESET}"
+echo -e "${DIM}${path}${RESET}"
+echo ""
+
+# Session summary info via Python
+python3 - "$path" "$has_sessions" << 'PYEOF'
+import sys, json, os, glob, re
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+has_sessions = sys.argv[2]
+
+BOLD   = '\033[1m'
+DIM    = '\033[2m'
+YELLOW = '\033[0;33m'
+GREEN  = '\033[0;32m'
+BLUE   = '\033[0;34m'
+RESET  = '\033[0m'
+
+def relative_date(iso_str):
+    if not iso_str:
+        return "unknown"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        secs = int((now - dt).total_seconds())
+        if secs < 60:    return "just now"
+        if secs < 3600:  return f"{secs//60}m ago"
+        if secs < 86400: return f"{secs//3600}h ago"
+        if secs < 172800: return "yesterday"
+        if secs < 604800: return f"{secs//86400}d ago"
+        if secs < 2592000: return f"{secs//604800}w ago"
+        return iso_str[:10]
+    except Exception:
+        return iso_str[:10] if iso_str else "?"
+
+def encode_path(p):
+    return re.sub(r'[^a-zA-Z0-9]', '-', p)
+
+if has_sessions == "1":
+    cp = os.path.expanduser("~/.claude/projects")
+    enc = encode_path(path)
+    session_dir = os.path.join(cp, enc)
+    sessions = []
+
+    if os.path.isdir(session_dir):
+        index_file = os.path.join(session_dir, "sessions-index.json")
+        if os.path.isfile(index_file):
+            try:
+                with open(index_file) as f:
+                    data = json.load(f)
+                entries = sorted(
+                    data.get("entries", []),
+                    key=lambda x: x.get("modified", ""),
+                    reverse=True
+                )
+                for e in entries:
+                    s = e.get("summary", "")
+                    if s and s != "User Exited Claude Code CLI Session":
+                        sessions.append({
+                            "summary": s,
+                            "modified": e.get("modified", ""),
+                            "messages": e.get("messageCount", 0),
+                        })
+            except Exception:
+                pass
+
+        if not sessions:
+            jsonl_files = sorted(
+                glob.glob(os.path.join(session_dir, "*.jsonl")),
+                key=os.path.getmtime, reverse=True
+            )
+            for jf in jsonl_files[:5]:
+                try:
+                    with open(jf) as f:
+                        for i, line in enumerate(f):
+                            if i > 30:
+                                break
+                            try:
+                                d = json.loads(line)
+                                if d.get("type") == "summary" and d.get("summary"):
+                                    s = d["summary"]
+                                    if s != "User Exited Claude Code CLI Session":
+                                        sessions.append({
+                                            "summary": s,
+                                            "modified": datetime.fromtimestamp(
+                                                os.path.getmtime(jf), tz=timezone.utc
+                                            ).isoformat(),
+                                            "messages": 0,
+                                        })
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+
+    if sessions:
+        total = len(sessions)
+        sess_word = "session" if total == 1 else "sessions"
+        date = relative_date(sessions[0]["modified"])
+        print(f"{BOLD}Sessions:{RESET} {YELLOW}{total} {sess_word}{RESET}  {DIM}last {date}{RESET}")
+        print()
+        for i, s in enumerate(sessions[:4]):
+            d = relative_date(s["modified"])
+            msgs = f"  {s['messages']} msgs" if s.get("messages") else ""
+            summary = s["summary"]
+            if len(summary) > 72:
+                summary = summary[:69] + "..."
+            print(f"  {YELLOW}{d}{msgs}{RESET}")
+            print(f"  {DIM}{summary}{RESET}")
+            if i < min(len(sessions), 4) - 1:
+                print()
+    else:
+        print(f"{DIM}No session summaries found.{RESET}")
+
+PYEOF
+
+# ── Git log ────────────────────────────────────────────────────────────────────
+if [ -d "$path/.git" ]; then
+    echo ""
+    echo -e "${BOLD}Recent commits:${RESET}"
+    git -C "$path" log --oneline --color=always -5 2>/dev/null \
+        | sed 's/^/  /' \
+        || echo -e "  ${DIM}(no commits)${RESET}"
+fi
+
+# ── File listing ───────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}Files:${RESET}"
+ls -1p "$path" 2>/dev/null | head -12 | sed 's/^/  /' || echo -e "  ${DIM}(empty)${RESET}"

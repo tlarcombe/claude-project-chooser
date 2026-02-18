@@ -240,6 +240,23 @@ from datetime import datetime, timezone
 claude_projects_dir = os.path.expanduser("~/.claude/projects")
 user_projects_dir = os.path.expanduser("~/projects")
 
+def relative_date(iso_str):
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        secs = int((now - dt).total_seconds())
+        if secs < 60:      return "just now"
+        if secs < 3600:    return f"{secs//60}m ago"
+        if secs < 86400:   return f"{secs//3600}h ago"
+        if secs < 172800:  return "yesterday"
+        if secs < 604800:  return f"{secs//86400}d ago"
+        if secs < 2592000: return f"{secs//604800}w ago"
+        return iso_str[:10]
+    except Exception:
+        return iso_str[:10] if iso_str else "?"
+
 projects = {}  # path -> {sessions, last_modified, summary}
 
 # Scan ~/.claude/projects/ for session data
@@ -368,18 +385,21 @@ without_sessions.sort(key=lambda x: os.path.basename(x[0]).lower())
 
 for path, info in with_sessions:
     name = os.path.basename(path)
-    date_str = info["last_modified"][:10] if info["last_modified"] else "unknown"
-    summary_text = info["summary"][:60].replace("\n", " ") if info["summary"] else ""
+    date_str = relative_date(info["last_modified"])
+    summary_text = info["summary"][:58].replace("\n", " ") if info["summary"] else ""
     sess = info["sessions"]
     sess_word = "session" if sess == 1 else "sessions"
-    line = f"\033[1;36m{name}\033[0m | {sess} {sess_word} | last: {date_str}"
+    # ● name  · N sessions · date · summary
+    line = (f"\033[32m●\033[0m \033[1;36m{name}\033[0m"
+            f"  \033[2m·\033[0m \033[33m{sess} {sess_word}\033[0m"
+            f" \033[2m· {date_str}\033[0m")
     if summary_text:
-        line += f" | \033[0;33m{summary_text}\033[0m"
+        line += f"  \033[2m{summary_text}\033[0m"
     print(f"1:{path}\t{line}")
 
 for path, info in without_sessions:
     name = os.path.basename(path)
-    line = f"\033[0;37m{name}\033[0m | \033[2mno sessions\033[0m"
+    line = f"\033[2m○ {name}\033[0m"
     print(f"0:{path}\t{line}")
 PYEOF
 }
@@ -414,8 +434,8 @@ main() {
             exit 1
         fi
 
-        local new_project_line=$'\t\033[1;32m+ NEW PROJECT\033[0m'
-        local no_project_line=$'NOPROJ:\t\033[1;33m~ NO PROJECT (no git)\033[0m'
+        local new_project_line=$'\t\033[1;32m✦  NEW PROJECT\033[0m'
+        local no_project_line=$'NOPROJ:\t\033[33m◈  NO PROJECT \033[2m(no git)\033[0m'
         local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
 
         # Run fzf — --expect captures Ctrl-A/X without opening the project.
@@ -425,14 +445,20 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Esc: cancel' \
+            --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
-            --height=80% \
-            --border \
-            --prompt="project> " \
+            --height=100% \
+            --border=rounded \
+            --prompt="  " \
+            --pointer="▶" \
+            --marker="✓" \
+            --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
             --expect=ctrl-a,ctrl-x \
+            --preview='~/.local/bin/claude-project-preview {1}' \
+            --preview-window='right:45%:wrap:border-left:hidden' \
+            --bind='ctrl-/:toggle-preview' \
         ) || break  # Esc/Ctrl-C exits the loop cleanly
 
         local pressed_key
