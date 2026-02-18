@@ -21,7 +21,8 @@ launch_claude() {
 
     while true; do
         > "$CLAUDE_OUTPUT_LOG"  # clear previous capture
-        script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG"
+        local _script_exit=0
+        script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG" || _script_exit=$?
 
         # Strip ANSI/terminal codes using Python (handles UTF-8 middle dots, etc.)
         # strings(1) breaks on non-ASCII chars like the · separator in rate-limit messages
@@ -41,12 +42,12 @@ print('\n'.join(lines[-500:]))
 
         # Debug log: save rate-limit-related lines for post-mortem
         {
-            echo "=== $(date) ==="
+            echo "=== $(date) === (exit code: $_script_exit) ==="
             echo "$tail_output" | grep -i "limit\|resets\|hit\|usage" || echo "(no match)"
         } >> "$RATE_LIMIT_DEBUG" 2>/dev/null
 
         # Detect rate limit: matches "hit your limit", "fast limit reached", etc.
-        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage"; then
+        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage\|usage limit\|rate.limit\|limit reached"; then
             local reset_line
             reset_line=$(echo "$tail_output" | grep -i "resets" | tail -1)
 
@@ -202,10 +203,14 @@ if os.path.isdir(claude_projects_dir):
         if not real_path:
             continue
 
-        # Get last_modified from jsonl file mtime if not from index
-        if not last_modified and jsonl_files:
+        # Get last_modified from jsonl file mtime, always comparing against index value.
+        # sessions-index.json can be stale (not updated by Claude on every session),
+        # so we take whichever is newer: the index date or the actual file mtime.
+        if jsonl_files:
             newest_mtime = max(os.path.getmtime(f) for f in jsonl_files)
-            last_modified = datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+            file_modified = datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat()
+            if not last_modified or file_modified > last_modified:
+                last_modified = file_modified
 
         # If no summary from index, try to get firstPrompt or summary from jsonl
         if not summary and jsonl_files:
@@ -279,6 +284,17 @@ PYEOF
 
 # Main
 main() {
+    # Run inside a named tmux session so it can be attached from anywhere.
+    # Skip if already inside tmux (TMUX is set) or if we were launched by tmux
+    # (CLAUDE_IN_TMUX is set, preventing infinite re-launch).
+    if [ -z "${TMUX:-}" ] && [ -z "${CLAUDE_IN_TMUX:-}" ]; then
+        if tmux has-session -t "claude+" 2>/dev/null; then
+            exec tmux attach-session -t "claude+"
+        else
+            exec tmux new-session -s "claude+" -e "CLAUDE_IN_TMUX=1" "claude+"
+        fi
+    fi
+
     if ! command -v fzf &>/dev/null; then
         echo "Error: fzf is required. Install with: sudo pacman -S fzf" >&2
         exit 1
