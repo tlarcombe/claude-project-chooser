@@ -128,6 +128,108 @@ PYEOF
     done
 }
 
+# Encode a filesystem path to the Claude session directory name format.
+# Claude replaces every non-alphanumeric character with a hyphen.
+encode_path() {
+    echo "$1" | python3 -c "import sys, re; print(re.sub(r'[^a-zA-Z0-9]', '-', sys.stdin.read().strip()))"
+}
+
+# Find all session dirs in ~/.claude/projects that belong to a given project path.
+# Checks both the current bind-mount path and the old /mnt/raid0 path (pre-bind-mount).
+find_session_dirs() {
+    local path="$1"
+    local cp="$HOME/.claude/projects"
+
+    local enc
+    enc=$(encode_path "$path")
+    [ -d "$cp/$enc" ] && echo "$cp/$enc"
+
+    # Also check old NAS-path encoding (sessions created before bind-mounts were set up)
+    local nas_path="${path/$HOME\/projects//mnt/raid0/projects}"
+    if [ "$nas_path" != "$path" ]; then
+        local nas_enc
+        nas_enc=$(encode_path "$nas_path")
+        [ "$nas_enc" != "$enc" ] && [ -d "$cp/$nas_enc" ] && echo "$cp/$nas_enc"
+    fi
+}
+
+# Archive a project: move it and its session data to the NAS backup area.
+archive_project() {
+    local path="$1"
+    local name
+    name=$(basename "$path")
+    local archive_dir="/mnt/raid0/backups/projects"
+
+    echo ""
+    echo "  Archive: $name"
+    echo "  From:    $path"
+    echo "  To:      $archive_dir/$name"
+    echo ""
+    echo -n "  Confirm? [y/N] "
+    read -r confirm
+    echo ""
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Cancelled."; return 1; }
+
+    mkdir -p "$archive_dir" || { echo "  Cannot create $archive_dir (NAS accessible?)" >&2; return 1; }
+    mv "$path" "$archive_dir/$name" || { echo "  Failed to move project." >&2; return 1; }
+    echo "  Project moved."
+
+    local archive_sessions="/mnt/raid0/backups/claude-sessions"
+    mkdir -p "$archive_sessions"
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        mv "$sd" "$archive_sessions/$(basename "$sd")" 2>/dev/null \
+            && echo "  Session data archived: $(basename "$sd")" || true
+    done < <(find_session_dirs "$path")
+
+    echo "  Done."
+}
+
+# Delete a project: remove directory, session data, and optionally the GitHub repo.
+delete_project() {
+    local path="$1"
+    local name
+    name=$(basename "$path")
+
+    # Detect GitHub remote before we delete the directory
+    local github_repo=""
+    if [ -d "$path/.git" ]; then
+        github_repo=$(cd "$path" && git remote get-url origin 2>/dev/null \
+            | sed -nE 's|.*github\.com[/:]([^/]+/[^/]+?)(\.git)?$|\1|p' || true)
+    fi
+
+    echo ""
+    echo "  DELETE: $name"
+    [ -n "$github_repo" ] && echo "  GitHub: github.com/$github_repo"
+    echo ""
+    echo -n "  Type project name to confirm: "
+    read -r confirm
+    echo ""
+    [ "$confirm" = "$name" ] || { echo "  Name mismatch, cancelled."; return 1; }
+
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        rm -rf "$sd"
+        echo "  Session data deleted: $(basename "$sd")"
+    done < <(find_session_dirs "$path")
+
+    rm -rf "$path"
+    echo "  Project directory deleted."
+
+    if [ -n "$github_repo" ] && command -v gh &>/dev/null; then
+        echo -n "  Delete GitHub repo $github_repo? [y/N] "
+        read -r del_gh
+        echo ""
+        if [[ "$del_gh" =~ ^[Yy]$ ]]; then
+            gh repo delete "$github_repo" --yes \
+                && echo "  GitHub repo deleted." \
+                || echo "  Failed to delete GitHub repo (check: gh auth status)."
+        fi
+    fi
+
+    echo "  Done."
+}
+
 # Build the project list using python3
 build_project_list() {
     python3 << 'PYEOF'
@@ -314,26 +416,56 @@ main() {
     local no_project_line=$'NOPROJ:\t\033[1;33m~ NO PROJECT (no git)\033[0m'
     local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
 
-    # Run fzf
-    local selection
-    selection=$(echo -e "$full_list" | fzf \
+    # Run fzf — --expect captures Ctrl-A/X without opening the project.
+    # Output: line 1 = key pressed ("" for Enter), line 2 = selected item.
+    local raw_selection
+    raw_selection=$(echo -e "$full_list" | fzf \
         --ansi \
         --delimiter='\t' \
         --with-nth=2 \
-        --header="Select a project (Enter to choose, Esc to cancel)" \
+        --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Esc: cancel' \
         --header-first \
         --no-sort \
         --reverse \
         --height=80% \
         --border \
         --prompt="project> " \
+        --expect=ctrl-a,ctrl-x \
     ) || exit 0  # Esc/Ctrl-C exits cleanly
+
+    local pressed_key
+    pressed_key=$(echo "$raw_selection" | head -1)
+    local selection
+    selection=$(echo "$raw_selection" | tail -n +2)
 
     # Extract the path (before the tab) - format is "HAS_SESSIONS:PATH\tDISPLAY"
     local selected_field
     selected_field=$(echo "$selection" | cut -f1)
     local selected_path="${selected_field#*:}"
     local has_sessions_flag="${selected_field%%:*}"
+
+    # Handle archive / delete — then re-exec to refresh the picker
+    if [ "$pressed_key" = "ctrl-a" ]; then
+        if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+            echo "  Select a real project to archive." >&2; sleep 1
+        elif [ ! -d "$selected_path" ]; then
+            echo "  Directory not found: $selected_path" >&2; sleep 1
+        else
+            archive_project "$selected_path" || true
+            sleep 1
+        fi
+        exec "$0"
+    fi
+
+    if [ "$pressed_key" = "ctrl-x" ]; then
+        if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+            echo "  Select a real project to delete." >&2; sleep 1
+        else
+            delete_project "$selected_path" || true
+            sleep 1
+        fi
+        exec "$0"
+    fi
 
     # Handle "~ NO PROJECT"
     if [ "$has_sessions_flag" = "NOPROJ" ]; then
