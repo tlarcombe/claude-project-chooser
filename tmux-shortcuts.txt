@@ -1,0 +1,23 @@
+ Session/window management
+  - Ctrl+b d — detach (leave session running, go back to shell)
+  - Ctrl+b $ — rename the session
+  - Ctrl+b c — create a new window (tab) within the session
+  - Ctrl+b n / Ctrl+b p — next/previous window
+  - Ctrl+b w — list all windows (pick with arrow keys)
+
+  Scrollback / copy mode
+  - Ctrl+b [ — enter scroll/copy mode manually (then arrow keys or Page Up/Down)
+  - q or Escape — exit scroll mode
+  - Ctrl+b ] — paste from tmux buffer
+
+  Splits (useful if you want a second pane for monitoring)
+  - Ctrl+b % — split vertically (side by side)
+  - Ctrl+b " — split horizontally (top/bottom)
+  - Ctrl+b arrow — move between panes
+  - Ctrl+b z — zoom a pane to full screen (toggle)
+  - Ctrl+b x — close current pane
+
+  From outside tmux
+  - tmux ls — list sessions
+  - tmux attach -t claude+ — reattach from any machine
+  - tmux attach -t claude+ -d — steal session from other machine
