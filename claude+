@@ -471,7 +471,7 @@ main() {
     if [ "$has_sessions_flag" = "NOPROJ" ]; then
         echo "Starting Claude without a project..."
         launch_claude --dangerously-skip-permissions
-        exit 0
+        exec "$0"
     fi
 
     # Handle "+ NEW PROJECT" (empty path)
@@ -479,8 +479,7 @@ main() {
         echo -n "New project name: "
         read -r project_name
         if [ -z "$project_name" ]; then
-            echo "No name given, aborting." >&2
-            exit 1
+            exec "$0"
         fi
 
         local new_dir="$USER_PROJECTS_DIR/$project_name"
@@ -489,7 +488,7 @@ main() {
             echo "Launching Claude in existing directory..."
             cd "$new_dir"
             launch_claude --dangerously-skip-permissions
-            exit 0
+            exec "$0"
         fi
 
         mkdir -p "$new_dir"
@@ -498,13 +497,14 @@ main() {
         touch CLAUDE.md
         echo "Created project: $new_dir"
         launch_claude --dangerously-skip-permissions
-        exit 0
+        exec "$0"
     fi
 
     # Handle existing project
     if [ ! -d "$selected_path" ]; then
         echo "Directory no longer exists: $selected_path" >&2
-        exit 1
+        sleep 1
+        exec "$0"
     fi
 
     cd "$selected_path"
@@ -516,6 +516,7 @@ main() {
         echo "Starting new session in: $selected_path"
         launch_claude --dangerously-skip-permissions
     fi
+    exec "$0"
 }
 
 main "$@"
