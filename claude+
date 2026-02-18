@@ -402,121 +402,123 @@ main() {
         exit 1
     fi
 
-    # Build project list
-    local project_list
-    project_list=$(build_project_list)
+    # Loop: show picker, launch project, return here on /exit.
+    # Esc/Ctrl-C in fzf breaks the loop and exits the tmux session.
+    while true; do
+        local project_list
+        project_list=$(build_project_list)
 
-    if [ -z "$project_list" ]; then
-        echo "No projects found." >&2
-        exit 1
-    fi
-
-    # Prepend special options
-    local new_project_line=$'\t\033[1;32m+ NEW PROJECT\033[0m'
-    local no_project_line=$'NOPROJ:\t\033[1;33m~ NO PROJECT (no git)\033[0m'
-    local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
-
-    # Run fzf — --expect captures Ctrl-A/X without opening the project.
-    # Output: line 1 = key pressed ("" for Enter), line 2 = selected item.
-    local raw_selection
-    raw_selection=$(echo -e "$full_list" | fzf \
-        --ansi \
-        --delimiter='\t' \
-        --with-nth=2 \
-        --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Esc: cancel' \
-        --header-first \
-        --no-sort \
-        --reverse \
-        --height=80% \
-        --border \
-        --prompt="project> " \
-        --expect=ctrl-a,ctrl-x \
-    ) || exit 0  # Esc/Ctrl-C exits cleanly
-
-    local pressed_key
-    pressed_key=$(echo "$raw_selection" | head -1)
-    local selection
-    selection=$(echo "$raw_selection" | tail -n +2)
-
-    # Extract the path (before the tab) - format is "HAS_SESSIONS:PATH\tDISPLAY"
-    local selected_field
-    selected_field=$(echo "$selection" | cut -f1)
-    local selected_path="${selected_field#*:}"
-    local has_sessions_flag="${selected_field%%:*}"
-
-    # Handle archive / delete — then re-exec to refresh the picker
-    if [ "$pressed_key" = "ctrl-a" ]; then
-        if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
-            echo "  Select a real project to archive." >&2; sleep 1
-        elif [ ! -d "$selected_path" ]; then
-            echo "  Directory not found: $selected_path" >&2; sleep 1
-        else
-            archive_project "$selected_path" || true
-            sleep 1
-        fi
-        exec "$0"
-    fi
-
-    if [ "$pressed_key" = "ctrl-x" ]; then
-        if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
-            echo "  Select a real project to delete." >&2; sleep 1
-        else
-            delete_project "$selected_path" || true
-            sleep 1
-        fi
-        exec "$0"
-    fi
-
-    # Handle "~ NO PROJECT"
-    if [ "$has_sessions_flag" = "NOPROJ" ]; then
-        echo "Starting Claude without a project..."
-        launch_claude --dangerously-skip-permissions
-        exec "$0"
-    fi
-
-    # Handle "+ NEW PROJECT" (empty path)
-    if [ -z "$selected_path" ]; then
-        echo -n "New project name: "
-        read -r project_name
-        if [ -z "$project_name" ]; then
-            exec "$0"
+        if [ -z "$project_list" ]; then
+            echo "No projects found." >&2
+            exit 1
         fi
 
-        local new_dir="$USER_PROJECTS_DIR/$project_name"
-        if [ -d "$new_dir" ]; then
-            echo "Directory already exists: $new_dir" >&2
-            echo "Launching Claude in existing directory..."
+        local new_project_line=$'\t\033[1;32m+ NEW PROJECT\033[0m'
+        local no_project_line=$'NOPROJ:\t\033[1;33m~ NO PROJECT (no git)\033[0m'
+        local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
+
+        # Run fzf — --expect captures Ctrl-A/X without opening the project.
+        # Output: line 1 = key pressed ("" for Enter), line 2 = selected item.
+        local raw_selection
+        raw_selection=$(echo -e "$full_list" | fzf \
+            --ansi \
+            --delimiter='\t' \
+            --with-nth=2 \
+            --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Esc: cancel' \
+            --header-first \
+            --no-sort \
+            --reverse \
+            --height=80% \
+            --border \
+            --prompt="project> " \
+            --expect=ctrl-a,ctrl-x \
+        ) || break  # Esc/Ctrl-C exits the loop cleanly
+
+        local pressed_key
+        pressed_key=$(echo "$raw_selection" | head -1)
+        local selection
+        selection=$(echo "$raw_selection" | tail -n +2)
+
+        # Extract the path — format is "HAS_SESSIONS:PATH\tDISPLAY"
+        local selected_field
+        selected_field=$(echo "$selection" | cut -f1)
+        local selected_path="${selected_field#*:}"
+        local has_sessions_flag="${selected_field%%:*}"
+
+        # Handle archive / delete — continue to refresh the picker
+        if [ "$pressed_key" = "ctrl-a" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to archive." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                archive_project "$selected_path" || true
+                sleep 1
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-x" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to delete." >&2; sleep 1
+            else
+                delete_project "$selected_path" || true
+                sleep 1
+            fi
+            continue
+        fi
+
+        # Handle "~ NO PROJECT"
+        if [ "$has_sessions_flag" = "NOPROJ" ]; then
+            echo "Starting Claude without a project..."
+            launch_claude --dangerously-skip-permissions || true
+            continue
+        fi
+
+        # Handle "+ NEW PROJECT" (empty path)
+        if [ -z "$selected_path" ]; then
+            echo -n "New project name: "
+            read -r project_name
+            if [ -z "$project_name" ]; then
+                continue
+            fi
+
+            local new_dir="$USER_PROJECTS_DIR/$project_name"
+            if [ -d "$new_dir" ]; then
+                echo "Directory already exists: $new_dir" >&2
+                echo "Launching Claude in existing directory..."
+                cd "$new_dir"
+                launch_claude --dangerously-skip-permissions || true
+                continue
+            fi
+
+            mkdir -p "$new_dir"
             cd "$new_dir"
-            launch_claude --dangerously-skip-permissions
-            exec "$0"
+            git init
+            touch CLAUDE.md
+            echo "Created project: $new_dir"
+            launch_claude --dangerously-skip-permissions || true
+            continue
         fi
 
-        mkdir -p "$new_dir"
-        cd "$new_dir"
-        git init
-        touch CLAUDE.md
-        echo "Created project: $new_dir"
-        launch_claude --dangerously-skip-permissions
-        exec "$0"
-    fi
+        # Handle existing project
+        if [ ! -d "$selected_path" ]; then
+            echo "Directory no longer exists: $selected_path" >&2
+            sleep 1
+            continue
+        fi
 
-    # Handle existing project
-    if [ ! -d "$selected_path" ]; then
-        echo "Directory no longer exists: $selected_path" >&2
-        sleep 1
-        exec "$0"
-    fi
+        cd "$selected_path"
 
-    cd "$selected_path"
-
-    if [ "$has_sessions_flag" = "1" ]; then
-        echo "Resuming in: $selected_path"
-        launch_claude --dangerously-skip-permissions --continue
-    else
-        echo "Starting new session in: $selected_path"
-        launch_claude --dangerously-skip-permissions
-    fi
-    exec "$0"
+        if [ "$has_sessions_flag" = "1" ]; then
+            echo "Resuming in: $selected_path"
+            launch_claude --dangerously-skip-permissions --continue || true
+        else
+            echo "Starting new session in: $selected_path"
+            launch_claude --dangerously-skip-permissions || true
+        fi
+        # Loop continues — picker shown again after claude exits
+    done
 }
 
 main "$@"
