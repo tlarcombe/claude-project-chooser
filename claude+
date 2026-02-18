@@ -404,6 +404,7 @@ main() {
 
     # Loop: show picker, launch project, return here on /exit.
     # Esc/Ctrl-C in fzf breaks the loop and exits the tmux session.
+    clear
     while true; do
         local project_list
         project_list=$(build_project_list)
@@ -517,6 +518,7 @@ main() {
             echo "Starting new session in: $selected_path"
             launch_claude --dangerously-skip-permissions || true
         fi
+        clear
         # Loop continues — picker shown again after claude exits
     done
 }
