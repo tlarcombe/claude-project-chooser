@@ -22,7 +22,27 @@ launch_claude() {
     while true; do
         > "$CLAUDE_OUTPUT_LOG"  # clear previous capture
         local _script_exit=0
+
+        # Background watcher: when Claude shows the rate-limit menu it waits for
+        # interactive input and never exits. Detect "/rate-limit-options" in the log
+        # and send Enter — option 1 ("Stop and wait") is pre-selected by default.
+        local WATCHER_PID=""
+        if [ -n "${TMUX_PANE:-}" ]; then
+            local _pane="$TMUX_PANE"
+            (
+                while sleep 3; do
+                    if tail -c 5000 "$CLAUDE_OUTPUT_LOG" 2>/dev/null | grep -q "rate-limit-options"; then
+                        sleep 2  # let menu render fully before sending input
+                        tmux send-keys -t "$_pane" "" Enter
+                        break
+                    fi
+                done
+            ) &
+            WATCHER_PID=$!
+        fi
+
         script -qfc "claude ${claude_args[*]}" "$CLAUDE_OUTPUT_LOG" || _script_exit=$?
+        [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
 
         # Strip ANSI/terminal codes using Python (handles UTF-8 middle dots, etc.)
         # strings(1) breaks on non-ASCII chars like the · separator in rate-limit messages
