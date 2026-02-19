@@ -429,8 +429,11 @@ fork_from_session() {
         echo "  Reinitialising git history…"
         rm -rf "$fork_path/.git"
         git -C "$fork_path" init -q
-        git -C "$fork_path" add -A
-        git -C "$fork_path" commit -q -m "Fork of $src_name"
+        git -C "$fork_path" add -A 2>/dev/null || true
+        git -C "$fork_path" \
+            -c user.name="${GIT_AUTHOR_NAME:-$(git config user.name 2>/dev/null || echo Fork)}" \
+            -c user.email="${GIT_AUTHOR_EMAIL:-$(git config user.email 2>/dev/null || echo fork@local)}" \
+            commit -q --allow-empty -m "Fork of $src_name" 2>/dev/null || true
         git -C "$fork_path" remote remove origin 2>/dev/null || true
     fi
 
