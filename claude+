@@ -458,6 +458,220 @@ fork_from_session() {
     launch_claude --dangerously-skip-permissions --continue || true
 }
 
+# Internal: rename a project directory and migrate session data.
+# Usage: _do_rename OLD_PATH NEW_NAME  (no interactive prompts)
+_do_rename() {
+    local old_path="$1"
+    local new_name="$2"
+    local parent_dir
+    parent_dir=$(dirname "$old_path")
+    local new_path="$parent_dir/$new_name"
+    local old_name
+    old_name=$(basename "$old_path")
+
+    if [ -d "$new_path" ]; then
+        echo "  Already exists: $new_path" >&2
+        return 1
+    fi
+
+    mv "$old_path" "$new_path"
+    echo "  Renamed: $old_name → $new_name"
+
+    # Migrate session JSONL files to the new encoded dir.
+    # find_session_dirs uses encode_path (looks in ~/.claude/projects/), so it
+    # still works after the project dir has been moved.
+    local new_session_dir="$HOME/.claude/projects/$(encode_path "$new_path")"
+    mkdir -p "$new_session_dir"
+    local moved=0
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        for jf in "$sd"/*.jsonl; do
+            [ -f "$jf" ] || continue
+            local dest="$new_session_dir/$(basename "$jf")"
+            # Avoid collision: prefix with old session-dir name
+            [ -f "$dest" ] && dest="$new_session_dir/$(basename "$sd")-$(basename "$jf")"
+            mv "$jf" "$dest" && moved=$((moved + 1))
+        done
+        rmdir "$sd" 2>/dev/null || true
+    done < <(find_session_dirs "$old_path")
+
+    [ $moved -gt 0 ] && echo "  Migrated $moved session file(s)."
+    return 0
+}
+
+# Rename a project interactively (prompts for new name, then calls _do_rename).
+rename_project() {
+    local path="$1"
+    local old_name
+    old_name=$(basename "$path")
+
+    echo ""
+    echo "  Rename project: $old_name"
+    echo -n "  New name [$old_name]: "
+    read -r new_name
+    echo ""
+    new_name="${new_name:-$old_name}"
+
+    [ "$new_name" = "$old_name" ] && { echo "  Unchanged."; sleep 1; return 0; }
+
+    if [[ "$new_name" =~ [/\\] ]]; then
+        echo "  Invalid name (no slashes allowed)." >&2
+        sleep 2
+        return 1
+    fi
+
+    _do_rename "$path" "$new_name" || { sleep 2; return 1; }
+    echo "  Done."
+    sleep 1
+}
+
+# Merge a source project into a chosen target project.
+# A second fzf picker selects the target; the user then picks the final name.
+merge_projects() {
+    local src_path="$1"
+    local src_name
+    src_name=$(basename "$src_path")
+
+    # Build project list excluding the source
+    local src_tab_pattern=":${src_path}"$'\t'
+    local project_list
+    project_list=$(build_project_list | grep -Fv "$src_tab_pattern")
+
+    if [ -z "$project_list" ]; then
+        echo "  No other projects available to merge into." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Second fzf picker: pick target
+    local raw_target
+    raw_target=$(echo -e "$project_list" | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=2 \
+        --header="$(printf '  Merge \033[1;36m%s\033[0m  →  which project?   ·   Esc: cancel' "$src_name")" \
+        --header-first \
+        --no-sort \
+        --reverse \
+        --height=100% \
+        --border=rounded \
+        --prompt="  merge into> " \
+        --pointer="▶" \
+        --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+    ) || { echo "  Cancelled."; sleep 1; return 0; }
+
+    local target_field
+    target_field=$(echo "$raw_target" | cut -f1)
+    local target_path="${target_field#*:}"
+    local target_name
+    target_name=$(basename "$target_path")
+
+    if [ -z "$target_path" ] || [ ! -d "$target_path" ]; then
+        echo "  Invalid target." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Choose the final project name
+    echo ""
+    echo "  ┌─ Merge: $src_name  →  $target_name"
+    echo "  │"
+    echo "  │  Final name for merged project:"
+    echo "  │    1) Keep target name:  $target_name"
+    echo "  │    2) Use source name:   $src_name"
+    echo "  │    3) Enter a new name"
+    echo "  │"
+    echo -n "  └─ Choice [1/2/3, default 1]: "
+    read -r name_choice
+    echo ""
+
+    local final_name
+    case "$name_choice" in
+        2) final_name="$src_name" ;;
+        3)
+            echo -n "  New name: "
+            read -r final_name
+            echo ""
+            if [ -z "$final_name" ]; then
+                echo "  Cancelled."; sleep 1; return 0
+            fi
+            if [[ "$final_name" =~ [/\\] ]]; then
+                echo "  Invalid name (no slashes)." >&2; sleep 2; return 1
+            fi
+            ;;
+        *) final_name="$target_name" ;;
+    esac
+
+    echo "  Will merge '$src_name' into '$final_name'."
+    echo -n "  Confirm? [y/N] "
+    read -r confirm
+    echo ""
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "  Cancelled."; sleep 1; return 0; }
+
+    # Step 1: Rename target if the final name differs
+    if [ "$final_name" != "$target_name" ]; then
+        local renamed_path
+        renamed_path="$(dirname "$target_path")/$final_name"
+        if [ -d "$renamed_path" ]; then
+            echo "  Name already taken: $renamed_path" >&2; sleep 2; return 1
+        fi
+        echo "  Renaming target: $target_name → $final_name…"
+        _do_rename "$target_path" "$final_name" || { sleep 2; return 1; }
+        target_path="$renamed_path"
+    fi
+
+    # Step 2: Concatenate CLAUDE.md (append source section to target)
+    if [ -f "$src_path/CLAUDE.md" ]; then
+        {
+            printf '\n---\n## Merged from: %s  (%s)\n\n' "$src_name" "$(date '+%Y-%m-%d')"
+            cat "$src_path/CLAUDE.md"
+        } >> "$target_path/CLAUDE.md"
+        echo "  CLAUDE.md merged."
+    fi
+
+    # Step 3: Copy source files into target (no-clobber; skip .git and CLAUDE.md)
+    if command -v rsync &>/dev/null; then
+        rsync -a --ignore-existing --exclude='.git' --exclude='CLAUDE.md' \
+            "$src_path/" "$target_path/" 2>/dev/null || true
+    else
+        find "$src_path" -mindepth 1 \
+            \( -name '.git' -o -name 'CLAUDE.md' \) -prune \
+            -o -type f -print | while IFS= read -r f; do
+            local rel="${f#"$src_path"/}"
+            local dest="$target_path/$rel"
+            if [ ! -f "$dest" ]; then
+                mkdir -p "$(dirname "$dest")"
+                cp "$f" "$dest"
+            fi
+        done
+    fi
+    echo "  Project files merged (target files take precedence)."
+
+    # Step 4: Move source session JSONLs into the target's session dir
+    local target_session_dir="$HOME/.claude/projects/$(encode_path "$target_path")"
+    mkdir -p "$target_session_dir"
+    local moved=0
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        for jf in "$sd"/*.jsonl; do
+            [ -f "$jf" ] || continue
+            local dest="$target_session_dir/$(basename "$jf")"
+            # Collision avoidance: prefix with nanoseconds
+            [ -f "$dest" ] && dest="$target_session_dir/$(date +%s%N | tail -c 8)-$(basename "$jf")"
+            mv "$jf" "$dest" && moved=$((moved + 1))
+        done
+        rmdir "$sd" 2>/dev/null || true
+    done < <(find_session_dirs "$src_path")
+    [ $moved -gt 0 ] && echo "  Moved $moved session file(s) to merged project."
+
+    # Step 5: Delete source project directory
+    rm -rf "$src_path"
+    echo "  Source '$src_name' deleted."
+    echo ""
+    echo "  ✓ Merge complete  →  $final_name"
+    sleep 2
+}
+
 # Build the project list using python3
 build_project_list() {
     python3 << 'PYEOF'
@@ -673,7 +887,7 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-Y: history  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header=$'Enter: open  Ctrl-Y: history  Ctrl-R: rename  Ctrl-G: merge\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
@@ -683,7 +897,7 @@ main() {
             --pointer="▶" \
             --marker="✓" \
             --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
-            --expect=ctrl-a,ctrl-x,ctrl-y \
+            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g \
             --preview='~/.local/bin/claude-project-preview {1}' \
             --preview-window='right:45%:wrap:border-left:hidden' \
             --bind='ctrl-/:toggle-preview' \
@@ -731,6 +945,28 @@ main() {
                 echo "  Directory not found: $selected_path" >&2; sleep 1
             else
                 browse_sessions "$selected_path" || true
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-r" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to rename." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                rename_project "$selected_path" || true
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-g" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a real project to merge." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                merge_projects "$selected_path" || true
             fi
             continue
         fi
