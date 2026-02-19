@@ -32,7 +32,7 @@ launch_claude() {
             (
                 while sleep 3; do
                     if tail -c 5000 "$CLAUDE_OUTPUT_LOG" 2>/dev/null | grep -q "rate-limit-options"; then
-                        sleep 2  # let menu render fully before sending input
+                        sleep 60  # pause before dismissing so user can see the menu
                         tmux send-keys -t "$_pane" "" Enter
                         break
                     fi
