@@ -670,7 +670,7 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-H: history  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header=$'Enter: open  Ctrl-Y: history  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
@@ -680,7 +680,7 @@ main() {
             --pointer="▶" \
             --marker="✓" \
             --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
-            --expect=ctrl-a,ctrl-x,ctrl-h \
+            --expect=ctrl-a,ctrl-x,ctrl-y \
             --preview='~/.local/bin/claude-project-preview {1}' \
             --preview-window='right:45%:wrap:border-left:hidden' \
             --bind='ctrl-/:toggle-preview' \
@@ -720,7 +720,7 @@ main() {
             continue
         fi
 
-        if [ "$pressed_key" = "ctrl-h" ]; then
+        if [ "$pressed_key" = "ctrl-y" ]; then
             if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ] \
                 || [ "$has_sessions_flag" = "0" ]; then
                 echo "  Select a project with sessions to browse history." >&2; sleep 1
