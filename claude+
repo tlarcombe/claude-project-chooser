@@ -474,7 +474,12 @@ _do_rename() {
         return 1
     fi
 
-    mv "$old_path" "$new_path"
+    # Explicit check: set -e is suppressed when this function is called via ||
+    local mv_err
+    if ! mv_err=$(mv "$old_path" "$new_path" 2>&1); then
+        echo "  Rename failed: $mv_err" >&2
+        return 1
+    fi
     echo "  Renamed: $old_name → $new_name"
 
     # Migrate session JSONL files to the new encoded dir.
@@ -568,6 +573,13 @@ merge_projects() {
 
     if [ -z "$target_path" ] || [ ! -d "$target_path" ]; then
         echo "  Invalid target." >&2
+        sleep 2
+        return 1
+    fi
+
+    # Safety: refuse to merge if either path is $HOME itself
+    if [ "$target_path" = "$HOME" ] || [ "$src_path" = "$HOME" ]; then
+        echo "  Cannot merge the home directory — aborting." >&2
         sleep 2
         return 1
     fi
@@ -762,6 +774,11 @@ if os.path.isdir(claude_projects_dir):
 
         # If still no real_path, skip this entry
         if not real_path:
+            continue
+
+        # Never show $HOME itself as a project — it's not a real project directory
+        home = os.path.expanduser("~")
+        if os.path.normpath(real_path) == os.path.normpath(home):
             continue
 
         # Get last_modified from jsonl file mtime, always comparing against index value.
