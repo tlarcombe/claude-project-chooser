@@ -250,6 +250,211 @@ delete_project() {
     echo "  Done."
 }
 
+# Build the session list for a project.
+# Output format: "FILEPATH\tDISPLAY_LINE" sorted newest-first.
+build_session_list() {
+    local project_path="$1"
+
+    # Collect all JSONL files from every session dir that belongs to this project
+    local all_files=()
+    while IFS= read -r sd; do
+        [ -z "$sd" ] && continue
+        while IFS= read -r jf; do
+            [ -f "$jf" ] && all_files+=("$jf")
+        done < <(ls -1 "$sd"/*.jsonl 2>/dev/null || true)
+    done < <(find_session_dirs "$project_path")
+
+    [ ${#all_files[@]} -eq 0 ] && return 0
+
+    python3 - "${all_files[@]}" << 'PYEOF'
+import sys, json, os
+from datetime import datetime, timezone
+
+files = sys.argv[1:]
+
+def rel_date(ts):
+    dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    s   = int((now - dt).total_seconds())
+    if s < 3600:    return f"{s//60}m ago"
+    if s < 86400:   return f"{s//3600}h ago"
+    if s < 172800:  return "yesterday"
+    if s < 604800:  return f"{s//86400}d ago"
+    if s < 2592000: return f"{s//604800}w ago"
+    return dt.strftime('%Y-%m-%d')
+
+sessions = []
+for f in files:
+    try:
+        mtime = os.path.getmtime(f)
+        size  = os.path.getsize(f)
+        first_msg  = ''
+        user_count = 0
+        with open(f, errors='replace') as fh:
+            for i, line in enumerate(fh):
+                if i > 3000: break
+                try:
+                    d = json.loads(line)
+                    if d.get('message', {}).get('role') == 'user':
+                        user_count += 1
+                        if not first_msg:
+                            content = d['message'].get('content', '')
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get('type') == 'text':
+                                        first_msg = c['text'].strip().replace('\n', ' ')
+                                        break
+                            elif isinstance(content, str):
+                                first_msg = content.strip().replace('\n', ' ')
+                except Exception:
+                    pass
+        sessions.append((mtime, f, first_msg[:75], user_count, size))
+    except Exception:
+        pass
+
+sessions.sort(reverse=True)
+
+for i, (mtime, f, first_msg, user_count, size) in enumerate(sessions):
+    date_str = rel_date(mtime)
+    sz       = f"{size//1024}KB" if size < 1048576 else f"{size//1048576}MB"
+    summary  = first_msg if first_msg else "(empty session)"
+    marker   = "\033[32m●\033[0m" if i == 0 else "\033[2m○\033[0m"
+    display  = (f"{marker}  \033[2m{date_str}\033[0m"
+                f"  \033[33m{user_count}q\033[0m  \033[2m{sz}\033[0m"
+                f"  {summary}")
+    print(f"{f}\t{display}")
+PYEOF
+}
+
+# Browse sessions for a project.
+# Enter: resume Claude from that session.
+# Ctrl-F: fork the project from that session point.
+# Esc: back to main picker.
+browse_sessions() {
+    local project_path="$1"
+    local project_name
+    project_name=$(basename "$project_path")
+
+    while true; do
+        local session_list
+        session_list=$(build_session_list "$project_path")
+
+        if [ -z "$session_list" ]; then
+            echo "  No sessions found for $project_name."
+            sleep 2
+            return 0
+        fi
+
+        local raw
+        raw=$(echo -e "$session_list" | fzf \
+            --ansi \
+            --delimiter='\t' \
+            --with-nth=2 \
+            --header="$(printf '  \033[1;36m%s\033[0m  ·  session history\n  Enter: resume  ·  Ctrl-F: fork  ·  Esc: back' "$project_name")" \
+            --header-first \
+            --no-sort \
+            --reverse \
+            --height=100% \
+            --border=rounded \
+            --prompt="  history> " \
+            --pointer="▶" \
+            --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+            --expect=ctrl-f \
+            --preview='python3 ~/.local/bin/claude-session-preview {1}' \
+            --preview-window='right:50%:wrap:border-left' \
+        ) || return 0  # Esc → back to main picker
+
+        local pressed_key selected_file
+        pressed_key=$(echo "$raw" | head -1)
+        selected_file=$(echo "$raw" | tail -n +2 | cut -f1)
+        [ -z "$selected_file" ] && return 0
+
+        if [ "$pressed_key" = "ctrl-f" ]; then
+            fork_from_session "$project_path" "$selected_file" || continue
+            return 0
+        else
+            resume_from_session "$project_path" "$selected_file"
+            return 0
+        fi
+    done
+}
+
+# Resume Claude from a specific session JSONL file.
+# Copies the file into the current-encoding session dir if needed,
+# then touches it so --continue picks it up as the most recent session.
+resume_from_session() {
+    local project_path="$1"
+    local session_file="$2"
+
+    local target_dir="$HOME/.claude/projects/$(encode_path "$project_path")"
+    mkdir -p "$target_dir"
+
+    # If the file lives in an old-encoded dir, copy it into the current one
+    local target_file="$target_dir/$(basename "$session_file")"
+    if [ "$session_file" != "$target_file" ]; then
+        cp "$session_file" "$target_file"
+    fi
+    touch "$target_file"
+
+    cd "$project_path"
+    launch_claude --dangerously-skip-permissions --continue || true
+}
+
+# Fork a project from a chosen session point.
+# Copies the project directory and seeds the new project with the chosen session.
+fork_from_session() {
+    local src_path="$1"
+    local session_file="$2"
+    local src_name
+    src_name=$(basename "$src_path")
+
+    echo ""
+    echo -n "  Fork name [${src_name}-fork]: "
+    read -r fork_name
+    fork_name="${fork_name:-${src_name}-fork}"
+    echo ""
+
+    local fork_path="$USER_PROJECTS_DIR/$fork_name"
+    if [ -d "$fork_path" ]; then
+        echo "  Already exists: $fork_path" >&2
+        sleep 2
+        return 1
+    fi
+
+    echo "  Copying project files…"
+    cp -r "$src_path" "$fork_path"
+
+    # Fresh git history from current state — keeps files, drops source commits
+    if [ -d "$fork_path/.git" ]; then
+        echo "  Reinitialising git history…"
+        rm -rf "$fork_path/.git"
+        git -C "$fork_path" init -q
+        git -C "$fork_path" add -A
+        git -C "$fork_path" commit -q -m "Fork of $src_name"
+        git -C "$fork_path" remote remove origin 2>/dev/null || true
+    fi
+
+    # Seed Claude session: copy the chosen JSONL into the new project's session dir
+    local new_session_dir="$HOME/.claude/projects/$(encode_path "$fork_path")"
+    mkdir -p "$new_session_dir"
+    local new_session_file="$new_session_dir/$(basename "$session_file")"
+    cp "$session_file" "$new_session_file"
+    touch "$new_session_file"
+
+    # Note the fork provenance in CLAUDE.md
+    local fork_claude_md="$fork_path/CLAUDE.md"
+    if [ -f "$fork_claude_md" ]; then
+        printf '\n---\n_Forked from **%s** on %s_\n' \
+            "$src_name" "$(date '+%Y-%m-%d')" >> "$fork_claude_md"
+    fi
+
+    echo "  Fork ready: $fork_path"
+    echo "  Opening Claude…"
+    sleep 1
+    cd "$fork_path"
+    launch_claude --dangerously-skip-permissions --continue || true
+}
+
 # Build the project list using python3
 build_project_list() {
     python3 << 'PYEOF'
@@ -465,7 +670,7 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header=$'Enter: open  Ctrl-H: history  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
@@ -475,7 +680,7 @@ main() {
             --pointer="▶" \
             --marker="✓" \
             --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
-            --expect=ctrl-a,ctrl-x \
+            --expect=ctrl-a,ctrl-x,ctrl-h \
             --preview='~/.local/bin/claude-project-preview {1}' \
             --preview-window='right:45%:wrap:border-left:hidden' \
             --bind='ctrl-/:toggle-preview' \
@@ -511,6 +716,18 @@ main() {
             else
                 delete_project "$selected_path" || true
                 sleep 1
+            fi
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-h" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ] \
+                || [ "$has_sessions_flag" = "0" ]; then
+                echo "  Select a project with sessions to browse history." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                browse_sessions "$selected_path" || true
             fi
             continue
         fi
