@@ -66,8 +66,9 @@ print('\n'.join(lines[-500:]))
             echo "$tail_output" | grep -i "limit\|resets\|hit\|usage" || echo "(no match)"
         } >> "$RATE_LIMIT_DEBUG" 2>/dev/null
 
-        # Detect rate limit: matches "hit your limit", "fast limit reached", etc.
-        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage\|usage limit\|rate.limit\|limit reached"; then
+        # Detect rate limit: matches specific Claude rate-limit messages only.
+        # Avoid broad patterns like "rate.limit" or "usage limit" which match normal conversation text.
+        if echo "$tail_output" | grep -qi "hit your.*limit\|fast limit reached\|out of extra usage\|You've hit your limit"; then
             local reset_line
             reset_line=$(echo "$tail_output" | grep -i "resets" | tail -1)
 
