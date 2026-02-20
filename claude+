@@ -27,11 +27,16 @@ launch_claude() {
         # interactive input and never exits. Detect "/rate-limit-options" in the log
         # and send Enter — option 1 ("Stop and wait") is pre-selected by default.
         local WATCHER_PID=""
-        if [ -n "${TMUX_PANE:-}" ]; then
-            local _pane="$TMUX_PANE"
+        local _pane="${TMUX_PANE:-}"
+        if [ -z "$_pane" ] && [ -n "${TMUX:-}" ]; then
+            _pane=$(tmux display-message -p '#{pane_id}' 2>/dev/null || true)
+        fi
+        if [ -n "$_pane" ]; then
+            echo "=== $(date) === watcher spawned for pane $_pane ===" >> "$RATE_LIMIT_DEBUG" 2>/dev/null
             (
                 while sleep 3; do
                     if tail -c 5000 "$CLAUDE_OUTPUT_LOG" 2>/dev/null | grep -q "rate-limit-options"; then
+                        echo "=== $(date) === rate-limit-options detected, dismissing in 60s ===" >> "$RATE_LIMIT_DEBUG" 2>/dev/null
                         sleep 60  # pause before dismissing so user can see the menu
                         tmux send-keys -t "$_pane" "" Enter
                         break
