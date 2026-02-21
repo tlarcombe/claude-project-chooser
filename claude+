@@ -9,6 +9,7 @@ set -euo pipefail
 USER_PROJECTS_DIR="$HOME/projects"
 CLAUDE_OUTPUT_LOG=$(mktemp /tmp/claude-session.XXXXXX)
 trap "rm -f '$CLAUDE_OUTPUT_LOG'" EXIT
+CONTINUE_STATE_FILE="$HOME/.claude/continue-state.json"
 
 # Launch claude with automatic rate-limit retry.
 # Uses `script` to transparently capture terminal output.
@@ -147,6 +148,167 @@ PYEOF
             break
         fi
     done
+}
+
+# Schedule a rate-limit continue: prompt for reset time, count down, then relaunch.
+# Ctrl-K in the main picker triggers this. Ctrl-C during countdown cancels but saves state.
+do_continue() {
+    local project_path="$1"
+    local project_name
+    project_name=$(basename "$project_path")
+
+    # Load any stored reset time for this project
+    local hint=""
+    if [ -f "$CONTINUE_STATE_FILE" ]; then
+        hint=$(python3 - "$project_path" "$CONTINUE_STATE_FILE" << 'PYEOF'
+import json, sys
+proj, sf = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(sf))
+    print(d.get(proj, {}).get('reset_desc', ''))
+except Exception:
+    pass
+PYEOF
+) || true
+    fi
+
+    echo ""
+    echo "  Schedule continue: $project_name"
+    if [ -n "$hint" ]; then
+        echo -n "  Reset time [$hint, or enter new time]: "
+    else
+        echo -n "  Reset time (e.g. '1am', '1:30am', '01:30'): "
+    fi
+    read -r reset_input
+    echo ""
+
+    [ -z "$reset_input" ] && reset_input="$hint"
+
+    if [ -z "$reset_input" ]; then
+        echo "  Cancelled."
+        sleep 1
+        return 0
+    fi
+
+    # Parse reset time → seconds from now
+    local sleep_secs
+    sleep_secs=$(python3 - "$reset_input" << 'PYEOF'
+import re, sys
+from datetime import datetime, timedelta
+
+line = sys.argv[1].strip()
+
+# Relative: "30m", "1h", "1h30m", "in 30m"
+m = re.search(r'(?:in\s+)?(?:(\d+)h)?\s*(?:(\d+)m)?$', line, re.IGNORECASE)
+if m and (m.group(1) or m.group(2)):
+    h = int(m.group(1) or 0)
+    mins = int(m.group(2) or 0)
+    if h or mins:
+        print(max(h * 3600 + mins * 60 + 60, 60))
+        sys.exit()
+
+# 12-hour format: "1am", "1:30am", "1:30 am"
+match = re.search(r'(\d{1,2}(?::\d{2})?\s*[ap]m)', line, re.IGNORECASE)
+if match:
+    ts = match.group(1).strip().upper().replace(' ', '')
+    now = datetime.now()
+    for fmt in ['%I:%M%p', '%I%p']:
+        try:
+            p = datetime.strptime(ts, fmt)
+            reset = now.replace(hour=p.hour, minute=p.minute, second=0, microsecond=0)
+            if reset <= now:
+                reset += timedelta(days=1)
+            print(max(int((reset - now).total_seconds()) + 60, 60))
+            sys.exit()
+        except ValueError:
+            pass
+
+# 24-hour format: "01:30", "13:30"
+m24 = re.match(r'^(\d{1,2}):(\d{2})$', line)
+if m24:
+    now = datetime.now()
+    reset = now.replace(hour=int(m24.group(1)), minute=int(m24.group(2)), second=0, microsecond=0)
+    if reset <= now:
+        reset += timedelta(days=1)
+    print(max(int((reset - now).total_seconds()) + 60, 60))
+    sys.exit()
+
+print(300)
+PYEOF
+) || true
+
+    if [ -z "$sleep_secs" ] || ! [[ "$sleep_secs" =~ ^[0-9]+$ ]]; then
+        echo "  Could not parse '$reset_input'. Try '1am' or '01:30'." >&2
+        sleep 2
+        return 0
+    fi
+
+    local reset_epoch=$(( $(date +%s) + sleep_secs ))
+    local mins=$(( sleep_secs / 60 ))
+
+    # Save state so the picker shows this as [~] waiting
+    python3 - "$project_path" "$CONTINUE_STATE_FILE" "$reset_epoch" "$reset_input" << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+proj, sf, epoch, desc = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+os.makedirs(os.path.dirname(sf), exist_ok=True)
+try:
+    d = json.load(open(sf)) if os.path.exists(sf) else {}
+except Exception:
+    d = {}
+d[proj] = {'reset_epoch': epoch, 'reset_desc': desc}
+json.dump(d, open(sf, 'w'), indent=2)
+PYEOF
+
+    # Blocking countdown — Ctrl-C cancels (but state is saved)
+    echo "  ============================================================"
+    echo "  Resuming '$project_name' in ~${mins} min  (reset: ${reset_input})"
+    echo "  Press Ctrl-C to cancel the countdown"
+    echo "  ============================================================"
+    echo ""
+
+    local cancelled=0
+    local spin_idx=0
+    local -a spinners=('-' '\' '|' '/')
+
+    trap 'cancelled=1' INT
+    while [ "$(date +%s)" -lt "$reset_epoch" ] && [ "$cancelled" -eq 0 ]; do
+        local remaining=$(( reset_epoch - $(date +%s) ))
+        local h=$(( remaining / 3600 ))
+        local m=$(( (remaining % 3600) / 60 ))
+        local s=$(( remaining % 60 ))
+        local spin="${spinners[$((spin_idx % 4))]}"
+        spin_idx=$(( spin_idx + 1 ))
+        printf "\r  [%s] %02d:%02d:%02d remaining  " "$spin" "$h" "$m" "$s"
+        sleep 1 || true
+    done
+    trap - INT
+    echo ""
+
+    if [ "$cancelled" -eq 1 ]; then
+        echo ""
+        echo "  Countdown cancelled. State saved - Ctrl-K again to restart."
+        sleep 2
+        return 0
+    fi
+
+    # Remove from state file
+    python3 - "$project_path" "$CONTINUE_STATE_FILE" << 'PYEOF' 2>/dev/null || true
+import json, os, sys
+proj, sf = sys.argv[1], sys.argv[2]
+if os.path.exists(sf):
+    try:
+        d = json.load(open(sf))
+        d.pop(proj, None)
+        json.dump(d, open(sf, 'w'), indent=2)
+    except Exception:
+        pass
+PYEOF
+
+    echo ""
+    echo "  Resuming $project_name..."
+    sleep 1
+    cd "$project_path"
+    launch_claude --dangerously-skip-permissions --continue || true
 }
 
 # Encode a filesystem path to the Claude session directory name format.
@@ -691,9 +853,47 @@ build_project_list() {
 import json
 import os
 import glob
+import time
 from datetime import datetime, timezone
 claude_projects_dir = os.path.expanduser("~/.claude/projects")
 user_projects_dir = os.path.expanduser("~/projects")
+
+def get_live_cwds():
+    """Return set of project paths with an active claude process."""
+    live = set()
+    try:
+        for entry in os.scandir('/proc'):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f'/proc/{entry.name}/cmdline', 'rb') as f:
+                    if b'claude' not in f.read():
+                        continue
+                cwd = os.readlink(f'/proc/{entry.name}/cwd')
+                live.add(os.path.normpath(cwd))
+            except (OSError, PermissionError, FileNotFoundError):
+                pass
+    except (OSError, PermissionError):
+        pass
+    return live
+
+def get_waiting_projects():
+    """Return dict of project_path -> reset_desc for active countdowns."""
+    waiting = {}
+    sf = os.path.expanduser('~/.claude/continue-state.json')
+    if os.path.isfile(sf):
+        try:
+            data = json.load(open(sf))
+            now = time.time()
+            for path, info in data.items():
+                if info.get('reset_epoch', 0) > now:
+                    waiting[os.path.normpath(path)] = info.get('reset_desc', '?')
+        except Exception:
+            pass
+    return waiting
+
+live_cwds = get_live_cwds()
+waiting_projects = get_waiting_projects()
 
 def relative_date(iso_str):
     if not iso_str:
@@ -849,17 +1049,31 @@ for path, info in with_sessions:
     summary_text = info["summary"][:58].replace("\n", " ") if info["summary"] else ""
     sess = info["sessions"]
     sess_word = "session" if sess == 1 else "sessions"
-    # ● name  · N sessions · date · summary
-    line = (f"\033[32m●\033[0m \033[1;36m{name}\033[0m"
+
+    norm = os.path.normpath(path)
+    if norm in live_cwds:
+        status_flag = "L"
+        marker = "\033[1;32m[>]\033[0m"   # bright green: live
+        extra  = "  \033[1;32m(LIVE)\033[0m"
+    elif norm in waiting_projects:
+        status_flag = "W"
+        marker = "\033[33m[~]\033[0m"     # yellow: waiting for continue
+        extra  = f"  \033[33m(waiting: {waiting_projects[norm]})\033[0m"
+    else:
+        status_flag = "1"
+        marker = "\033[32m[*]\033[0m"     # green: normal
+        extra  = ""
+
+    line = (f"{marker} \033[1;36m{name}\033[0m"
             f"  \033[2m·\033[0m \033[33m{sess} {sess_word}\033[0m"
-            f" \033[2m· {date_str}\033[0m")
-    if summary_text:
+            f" \033[2m· {date_str}\033[0m{extra}")
+    if summary_text and status_flag not in ("L", "W"):
         line += f"  \033[2m{summary_text}\033[0m"
-    print(f"1:{path}\t{line}")
+    print(f"{status_flag}:{path}\t{line}")
 
 for path, info in without_sessions:
     name = os.path.basename(path)
-    line = f"\033[2m○ {name}\033[0m"
+    line = f"\033[2m[-] {name}\033[0m"
     print(f"0:{path}\t{line}")
 PYEOF
 }
@@ -905,7 +1119,7 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-Y: history  Ctrl-R: rename  Ctrl-G: merge\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header=$'Enter: open  Ctrl-Y: history  Ctrl-R: rename  Ctrl-G: merge  Ctrl-K: continue\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
@@ -915,7 +1129,7 @@ main() {
             --pointer="▶" \
             --marker="✓" \
             --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
-            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g \
+            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g,ctrl-k \
             --preview='~/.local/bin/claude-project-preview {1}' \
             --preview-window='right:45%:wrap:border-left:hidden' \
             --bind='ctrl-/:toggle-preview' \
@@ -989,6 +1203,18 @@ main() {
             continue
         fi
 
+        if [ "$pressed_key" = "ctrl-k" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ]; then
+                echo "  Select a project to schedule a continue." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                do_continue "$selected_path" || true
+            fi
+            clear
+            continue
+        fi
+
         # Handle "~ NO PROJECT"
         if [ "$has_sessions_flag" = "NOPROJ" ]; then
             echo "Starting Claude without a project..."
@@ -1031,7 +1257,14 @@ main() {
 
         cd "$selected_path"
 
-        if [ "$has_sessions_flag" = "1" ]; then
+        # Selecting a [~] waiting project resumes the countdown directly
+        if [ "$has_sessions_flag" = "W" ]; then
+            do_continue "$selected_path" || true
+            clear
+            continue
+        fi
+
+        if [[ "$has_sessions_flag" =~ ^(1|L)$ ]]; then
             echo "Resuming in: $selected_path"
             launch_claude --dangerously-skip-permissions --continue || true
         else
