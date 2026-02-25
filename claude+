@@ -1285,9 +1285,10 @@ main() {
             exit 1
         fi
 
-        local new_project_line=$'\t\033[1;32m✦  NEW PROJECT\033[0m'
+        local new_project_line=$'\t\033[1;32m✦  NEW PROJECT \033[2m(with git)\033[0m'
+        local nogit_project_line=$'NOGIT:\t\033[0;32m◇  NEW PROJECT \033[2m(no git, no github)\033[0m'
         local no_project_line=$'NOPROJ:\t\033[33m◈  NO PROJECT \033[2m(no git)\033[0m'
-        local full_list="${new_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
+        local full_list="${new_project_line}"$'\n'"${nogit_project_line}"$'\n'"${no_project_line}"$'\n'"${project_list}"
 
         # Run fzf — --expect captures Ctrl-A/X without opening the project.
         # Output: line 1 = key pressed ("" for Enter), line 2 = selected item.
@@ -1418,7 +1419,32 @@ main() {
             continue
         fi
 
-        # Handle "+ NEW PROJECT" (empty path)
+        # Handle "◇ NEW PROJECT (no git)"
+        if [ "$has_sessions_flag" = "NOGIT" ]; then
+            echo -n "New project name (no git): "
+            read -r project_name
+            if [ -z "$project_name" ]; then
+                continue
+            fi
+
+            local new_dir="$USER_PROJECTS_DIR/$project_name"
+            if [ -d "$new_dir" ]; then
+                echo "Directory already exists: $new_dir" >&2
+                echo "Launching Claude in existing directory..."
+                cd "$new_dir"
+                launch_claude --dangerously-skip-permissions || true
+                continue
+            fi
+
+            mkdir -p "$new_dir"
+            cd "$new_dir"
+            touch CLAUDE.md
+            echo "Created project (no git): $new_dir"
+            launch_claude --dangerously-skip-permissions || true
+            continue
+        fi
+
+        # Handle "✦ NEW PROJECT (with git)" (empty path)
         if [ -z "$selected_path" ]; then
             echo -n "New project name: "
             read -r project_name

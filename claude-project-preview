@@ -14,14 +14,26 @@ field="${1:-}"
 path="${field#*:}"
 has_sessions="${field%%:*}"
 
-# ── New Project ────────────────────────────────────────────────────────────────
+# ── New Project (with git) ─────────────────────────────────────────────────────
 if [ -z "$field" ] || [ -z "$path" ]; then
-    echo -e "${GREEN}${BOLD}✦ New Project${RESET}"
+    echo -e "${GREEN}${BOLD}✦ New Project  (with git)${RESET}"
     echo ""
     echo "  Create a new project directory in ~/projects/"
     echo "  and start a fresh Claude Code session."
     echo ""
     echo -e "  ${DIM}Will: mkdir, git init, create CLAUDE.md${RESET}"
+    exit 0
+fi
+
+# ── New Project (no git) ───────────────────────────────────────────────────────
+if [ "$has_sessions" = "NOGIT" ]; then
+    echo -e "${GREEN}${BOLD}◇ New Project  (no git, no github)${RESET}"
+    echo ""
+    echo "  Create a new project directory in ~/projects/"
+    echo "  with Claude context but no git repository."
+    echo ""
+    echo -e "  ${DIM}Will: mkdir, create CLAUDE.md${RESET}"
+    echo -e "  ${DIM}Sessions are stored as normal — just no git history${RESET}"
     exit 0
 fi
 
