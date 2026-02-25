@@ -1,0 +1,40 @@
+#!/bin/bash
+cat << 'EOF'
+
+  CLAUDE+ PICKER
+    Enter        open project        Ctrl-Y  session history
+    Ctrl-F       search in project   Ctrl-S  search all projects
+    Ctrl-R       rename project      Ctrl-G  merge projects
+    Ctrl-K       schedule continue   Ctrl-/  toggle preview
+    Ctrl-A       archive project     Ctrl-X  delete project
+    Esc          quit
+
+  SESSION
+    C-b d        detach (session keeps running)
+    C-b $        rename session
+    C-b s        list sessions
+
+  WINDOWS (tabs)
+    C-b c        new window
+    C-b n / p    next / previous window
+    C-b w        pick window from list
+
+  SCROLLBACK
+    C-b [        enter scroll mode
+    mouse wheel  scroll (mouse mode on)
+    q / Escape   exit scroll mode
+
+  PANES
+    C-b %        split vertical
+    C-b "        split horizontal
+    C-b arrow    move between panes
+    C-b z        zoom pane (toggle fullscreen)
+    C-b x        close pane
+
+  FROM OUTSIDE TMUX
+    claude+                    attach or create session
+    tmux attach -t claude+ -d  steal from other machine
+
+  Press any key to close...
+EOF
+read -rn1
