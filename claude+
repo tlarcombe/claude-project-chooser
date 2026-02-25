@@ -489,6 +489,183 @@ for i, (mtime, f, first_msg, user_count, size) in enumerate(sessions):
 PYEOF
 }
 
+# Search session content for a phrase.
+# Usage: search_sessions [project_path]
+# Without project_path: searches across all known projects.
+# Results shown in fzf; Enter opens that session.
+search_sessions() {
+    local project_filter="${1:-}"
+    local scope_label
+    if [ -n "$project_filter" ]; then
+        scope_label="in $(basename "$project_filter")"
+    else
+        scope_label="across all projects"
+    fi
+
+    echo ""
+    echo -n "  Search $scope_label: "
+    read -r query
+    echo ""
+    [ -z "$query" ] && { echo "  Cancelled."; sleep 1; return 0; }
+
+    echo "  Searching…"
+
+    local results
+    results=$(python3 - "$query" "$project_filter" << 'PYEOF'
+import sys, json, os, glob, re
+from datetime import datetime, timezone
+
+query       = sys.argv[1]
+proj_filter = sys.argv[2] if len(sys.argv) > 2 else ''
+pattern     = re.compile(re.escape(query), re.IGNORECASE)
+cp          = os.path.expanduser('~/.claude/projects')
+
+def encode_path(p):
+    return re.sub(r'[^a-zA-Z0-9]', '-', p)
+
+def relative_date(ts):
+    now = datetime.now(timezone.utc)
+    dt  = datetime.fromtimestamp(ts, tz=timezone.utc)
+    s   = int((now - dt).total_seconds())
+    if s < 3600:   return f"{s//60}m ago"
+    if s < 86400:  return f"{s//3600}h ago"
+    if s < 172800: return "yesterday"
+    if s < 604800: return f"{s//86400}d ago"
+    return dt.strftime('%Y-%m-%d')
+
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(b.get('text', '') for b in content
+                         if isinstance(b, dict) and b.get('type') == 'text')
+    return ''
+
+def get_project_path(session_dir):
+    idx = os.path.join(session_dir, 'sessions-index.json')
+    if os.path.isfile(idx):
+        try:
+            d = json.load(open(idx))
+            p = d.get('originalPath')
+            if p: return p
+        except Exception: pass
+    for jf in sorted(glob.glob(os.path.join(session_dir, '*.jsonl')),
+                     key=os.path.getmtime, reverse=True):
+        try:
+            with open(jf) as f:
+                for i, line in enumerate(f):
+                    if i > 5: break
+                    try:
+                        d = json.loads(line)
+                        if d.get('cwd'): return d['cwd']
+                    except Exception: pass
+        except Exception: pass
+    return None
+
+# Collect (session_dir, project_path) pairs to search
+pairs = []
+if proj_filter:
+    home    = os.path.expanduser('~')
+    nas     = proj_filter.replace(f'{home}/projects', '/mnt/raid0/projects')
+    for p in [proj_filter] + ([nas] if nas != proj_filter else []):
+        sd = os.path.join(cp, encode_path(p))
+        if os.path.isdir(sd):
+            pairs.append((sd, proj_filter))
+else:
+    if os.path.isdir(cp):
+        for entry in os.scandir(cp):
+            if not entry.is_dir(): continue
+            proj_path = get_project_path(entry.path)
+            if proj_path:
+                pairs.append((entry.path, proj_path))
+
+results = []
+for session_dir, proj_path in pairs:
+    proj_name = os.path.basename(proj_path)
+    for jf in glob.glob(os.path.join(session_dir, '*.jsonl')):
+        hits_u, hits_a = 0, 0
+        best_snippet   = ''
+        try:
+            with open(jf, errors='replace') as f:
+                for line in f:
+                    try:
+                        d    = json.loads(line)
+                        msg  = d.get('message', {})
+                        role = msg.get('role', '')
+                        if role not in ('user', 'assistant'): continue
+                        text = extract_text(msg.get('content', ''))
+                        for m in pattern.finditer(text):
+                            if role == 'user': hits_u += 1
+                            else:              hits_a += 1
+                            if not best_snippet:
+                                s = max(0, m.start() - 50)
+                                e = min(len(text), m.end() + 90)
+                                best_snippet = text[s:e].replace('\n', ' ').strip()
+                    except Exception: pass
+        except Exception: pass
+
+        n = hits_u + hits_a
+        if not n: continue
+
+        mtime   = os.path.getmtime(jf)
+        date    = relative_date(mtime)
+        parts   = []
+        if hits_u: parts.append(f"{hits_u} by you")
+        if hits_a: parts.append(f"{hits_a} by Claude")
+        detail  = ', '.join(parts)
+        snippet = best_snippet[:90] + '…' if len(best_snippet) > 90 else best_snippet
+
+        display = (f"\033[1;36m{proj_name}\033[0m"
+                   f"  \033[2m{date}\033[0m"
+                   f"  \033[33m{n} hit{'s' if n>1 else ''}  \033[2m({detail})\033[0m"
+                   f"  \033[2m…{snippet}…\033[0m")
+        # Field 1: JSONL path (for preview)
+        # Field 2: project path (for resume action)
+        # Field 3: display
+        results.append((mtime, jf, proj_path, display))
+
+results.sort(reverse=True)
+for _, jf, proj_path, display in results:
+    print(f"{jf}\t{proj_path}\t{display}")
+PYEOF)
+
+    if [ -z "$results" ]; then
+        echo "  No matches found for: $query"
+        sleep 2
+        return 0
+    fi
+
+    local count
+    count=$(echo "$results" | wc -l)
+
+    local raw
+    raw=$(echo -e "$results" | fzf \
+        --ansi \
+        --delimiter='\t' \
+        --with-nth=3 \
+        --header="$(printf '  Search: \033[33m%s\033[0m  ·  %d result(s)  ·  Enter: open session  ·  Esc: back' "$query" "$count")" \
+        --header-first \
+        --no-sort \
+        --reverse \
+        --height=100% \
+        --border=rounded \
+        --prompt="  filter> " \
+        --pointer="▶" \
+        --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
+        --preview='python3 ~/.local/bin/claude-session-preview {1}' \
+        --preview-window='right:50%:wrap:border-left' \
+    ) || return 0
+
+    local session_file selected_proj
+    session_file=$(echo "$raw" | cut -f1)
+    selected_proj=$(echo "$raw" | cut -f2)
+
+    [ -z "$session_file" ] || [ -z "$selected_proj" ] && return 0
+    [ -d "$selected_proj" ] || { echo "  Project not found: $selected_proj" >&2; sleep 2; return 0; }
+
+    resume_from_session "$selected_proj" "$session_file"
+}
+
 # Browse sessions for a project.
 # Enter: resume Claude from that session.
 # Ctrl-F: fork the project from that session point.
@@ -1119,7 +1296,7 @@ main() {
             --ansi \
             --delimiter='\t' \
             --with-nth=2 \
-            --header=$'Enter: open  Ctrl-Y: history  Ctrl-R: rename  Ctrl-G: merge  Ctrl-K: continue\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
+            --header=$'Enter: open  Ctrl-Y: history  Ctrl-F: find  Ctrl-S: search all  Ctrl-R: rename  Ctrl-G: merge  Ctrl-K: continue\n  Ctrl-A: archive  Ctrl-X: delete  Ctrl-/: preview  Esc: quit' \
             --header-first \
             --no-sort \
             --reverse \
@@ -1129,7 +1306,7 @@ main() {
             --pointer="▶" \
             --marker="✓" \
             --color='bg+:#313244,hl:#89b4fa,hl+:#89b4fa,pointer:#f38ba8,prompt:#cba6f7,marker:#a6e3a1,header:#89dceb,border:#585b70' \
-            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g,ctrl-k \
+            --expect=ctrl-a,ctrl-x,ctrl-y,ctrl-r,ctrl-g,ctrl-k,ctrl-f,ctrl-s \
             --preview='~/.local/bin/claude-project-preview {1}' \
             --preview-window='right:45%:wrap:border-left:hidden' \
             --bind='ctrl-/:toggle-preview' \
@@ -1211,6 +1388,25 @@ main() {
             else
                 do_continue "$selected_path" || true
             fi
+            clear
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-f" ]; then
+            if [ -z "$selected_path" ] || [ "$has_sessions_flag" = "NOPROJ" ] \
+                || [ "$has_sessions_flag" = "0" ]; then
+                echo "  Select a project with sessions to search within it." >&2; sleep 1
+            elif [ ! -d "$selected_path" ]; then
+                echo "  Directory not found: $selected_path" >&2; sleep 1
+            else
+                search_sessions "$selected_path" || true
+            fi
+            clear
+            continue
+        fi
+
+        if [ "$pressed_key" = "ctrl-s" ]; then
+            search_sessions || true
             clear
             continue
         fi
